@@ -94,6 +94,8 @@ If you have an Apple laptop or desktop with Apple Silicon, we've set up a simple
 
 If you don't have a Mac with Apple Silicon, you can run an adapted version of this script without MLX support. Just ask [Codex](https://openai.com/codex/) to refactor it; the change is straightforward. It may still be fairly slow, so we recommend jumping straight to cloud GPUs with Runpod.
 
+For Windows users, `train_gpt.py` now supports CPU fallback and can run without CUDA/MLX for local smoke tests. If you have an NVIDIA GPU on Windows, install a CUDA-enabled PyTorch build and use `torchrun` as shown below.
+
 First, clone the repository, create a fresh Python environment, and install the packages needed for the MLX path plus dataset download:
 
 ```bash
@@ -126,6 +128,34 @@ python3 train_gpt_mlx.py
 ```
 
 Validation always runs on the full `fineweb_val_*` split, which is the fixed first-50k-document set. The smoke command above skips periodic validation and just prints the final `val_loss` and `val_bpb` once at the end.
+
+### Local smoke run (Windows/Linux, no Apple Silicon required)
+
+If you're on Windows and don't have Apple Silicon, use the PyTorch script directly:
+
+```bash
+RUN_ID=torch_cpu_smoke \
+ITERATIONS=20 \
+TRAIN_BATCH_TOKENS=8192 \
+TRAIN_SEQ_LEN=256 \
+VAL_LOSS_EVERY=0 \
+MAX_WALLCLOCK_SECONDS=0 \
+python train_gpt.py
+```
+
+On CPU this is intentionally slow and intended only as a correctness smoke test before moving to a GPU machine.
+
+PowerShell equivalent:
+
+```powershell
+$env:RUN_ID="torch_cpu_smoke"
+$env:ITERATIONS="20"
+$env:TRAIN_BATCH_TOKENS="8192"
+$env:TRAIN_SEQ_LEN="256"
+$env:VAL_LOSS_EVERY="0"
+$env:MAX_WALLCLOCK_SECONDS="0"
+python train_gpt.py
+```
 
 ### Scaling Up to a Remote Machine
 

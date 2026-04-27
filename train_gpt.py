@@ -97,7 +97,7 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
     # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
     # Muon uses this to normalize matrix-shaped gradients before applying them.
     a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.bfloat16()
+    X = G.to(dtype=torch.bfloat16 if G.is_cuda else torch.float32)
     X /= X.norm() + eps
     transposed = G.size(0) > G.size(1)
     if transposed:
@@ -137,7 +137,8 @@ class Muon(torch.optim.Optimizer):
             nesterov = group["nesterov"]
 
             total_params = sum(int(p.numel()) for p in params)
-            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
+            update_dtype = torch.bfloat16 if params[0].is_cuda else torch.float32
+            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=update_dtype)
 
             curr = 0
             for i, p in enumerate(params):
@@ -255,7 +256,7 @@ def eval_val(
             local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
                 batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
@@ -733,7 +734,6 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -745,28 +745,40 @@ def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if world_size <= 0:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
-    if 8 % world_size != 0:
-        raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
-    grad_accum_steps = 8 // world_size
+    cuda_available = torch.cuda.is_available()
+    compile_default = "1" if cuda_available else "0"
+    use_torch_compile = bool(int(os.environ.get("TORCH_COMPILE", compile_default)))
+    if use_torch_compile and hasattr(torch, "compile"):
+        zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    if cuda_available:
+        if 8 % world_size != 0:
+            raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
+        grad_accum_steps = 8 // world_size
+        device = torch.device("cuda", local_rank)
+        torch.cuda.set_device(device)
+    else:
+        grad_accum_steps = 1
+        device = torch.device("cpu")
     grad_scale = 1.0 / grad_accum_steps
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required")
-    device = torch.device("cuda", local_rank)
-    torch.cuda.set_device(device)
     if distributed:
-        dist.init_process_group(backend="nccl", device_id=device)
+        backend = "nccl" if cuda_available else "gloo"
+        if cuda_available:
+            dist.init_process_group(backend=backend, device_id=device)
+        else:
+            dist.init_process_group(backend=backend)
         dist.barrier()
     master_process = rank == 0
 
-    # Fast math knobs
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
+    if cuda_available:
+        # Fast math knobs
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
 
-    enable_cudnn_sdp(False)
-    enable_flash_sdp(True)
-    enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+        enable_cudnn_sdp(False)
+        enable_flash_sdp(True)
+        enable_mem_efficient_sdp(False)
+        enable_math_sdp(False)
 
     logfile = None
     if master_process:
@@ -787,10 +799,11 @@ def main() -> None:
     log0("=" * 100, console=False)
     log0(f"Running Python {sys.version}", console=False)
     log0(f"Running PyTorch {torch.__version__}", console=False)
-    log0(
-        subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).stdout,
-        console=False,
-    )
+    if cuda_available:
+        log0(
+            subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).stdout,
+            console=False,
+        )
     log0("=" * 100, console=False)
 
     # -----------------------------
@@ -800,7 +813,8 @@ def main() -> None:
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
+    if cuda_available:
+        torch.cuda.manual_seed_all(args.seed)
 
     if not args.tokenizer_path.endswith(".model"):
         raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
@@ -823,6 +837,7 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
+    model_dtype = torch.bfloat16 if cuda_available else torch.float32
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -835,13 +850,20 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-    ).to(device).bfloat16()
+    ).to(device=device, dtype=model_dtype)
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    compiled_model = (
+        torch.compile(base_model, dynamic=False, fullgraph=True)
+        if cuda_available and use_torch_compile and hasattr(torch, "compile")
+        else base_model
+    )
+    if distributed:
+        model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if cuda_available else DDP(compiled_model)
+    else:
+        model = compiled_model
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
@@ -866,7 +888,7 @@ def main() -> None:
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
-        fused=True,
+        fused=cuda_available,
     )
     optimizer_muon = Muon(
         matrix_params,
@@ -880,7 +902,7 @@ def main() -> None:
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
-        fused=True,
+        fused=cuda_available,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if base_model.lm_head is not None:
@@ -888,13 +910,13 @@ def main() -> None:
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
-            fused=True,
+            fused=cuda_available,
         )
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
-    log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
+    log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps} device:{device.type}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
@@ -944,7 +966,7 @@ def main() -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=cuda_available):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
@@ -966,7 +988,8 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    torch.cuda.synchronize()
+    if cuda_available:
+        torch.cuda.synchronize()
     t0 = time.perf_counter()
 
     step = 0
@@ -975,7 +998,8 @@ def main() -> None:
 
         should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
         if should_validate:
-            torch.cuda.synchronize()
+            if cuda_available:
+                torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
             val_loss, val_bpb = eval_val(
                 args,
@@ -993,7 +1017,8 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
-            torch.cuda.synchronize()
+            if cuda_available:
+                torch.cuda.synchronize()
             t0 = time.perf_counter()
 
         if last_step:
@@ -1012,7 +1037,7 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=cuda_available):
                 loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
@@ -1054,10 +1079,11 @@ def main() -> None:
         if stop_after_step is None and reached_cap:
             stop_after_step = step
 
-    log0(
-        f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
-        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
+    if cuda_available:
+        log0(
+            f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+            f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
@@ -1097,7 +1123,8 @@ def main() -> None:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
-    torch.cuda.synchronize()
+    if cuda_available:
+        torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
         args,
@@ -1111,7 +1138,8 @@ def main() -> None:
         has_leading_space_lut,
         is_boundary_token_lut,
     )
-    torch.cuda.synchronize()
+    if cuda_available:
+        torch.cuda.synchronize()
     log0(
         f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
